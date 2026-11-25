@@ -13,8 +13,7 @@ On-device LLM chat for iPad Pro M4 (16 GB). SwiftUI + MLX (Apple Silicon) with a
 ## Build & run
 
 ```sh
-git submodule update --init --recursive   # LocalLLMClient + llama.cpp
-./Scripts/patch-vendor.sh                 # required for Xcode 27 clang module scanning (idempotent)
+git submodule update --init --recursive   # llama.cpp sources (required by the vendored LocalLLMClient)
 xcodegen generate
 open MLXChat.xcodeproj
 ```
