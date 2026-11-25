@@ -1,0 +1,9 @@
+.gitconfig
+.DS_Store
+.build/
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+.research/
