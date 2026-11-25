@@ -1,28 +1,28 @@
 # MLX iOS Wrapper for iPad Pro M4 (16GB) — Implementation Manual
 
-**Author:** Claude (research + plan)  
-**Owner:** Luke (zautke)  
-**Target device:** iPad Pro 11" M4, 1TB/2TB tier — 16GB unified memory, 10-core CPU, 10-core GPU, 16-core Neural Engine, 120GB/s memory bandwidth  
-**Target OS:** iPadOS 26+ (for `SpeechAnalyzer` v1 dictation; falls back to `SFSpeechRecognizer` on iPadOS 18)  
-**Date:** April 26, 2026
+**Author:** Claude (research + plan)
+**Owner:** Luke (zautke)
+**Target device:** iPad Pro 11" M4, 1TB/2TB tier — 16GB unified memory, 10-core CPU, 10-core GPU, 16-core Neural Engine, 120GB/s memory bandwidth ("presto", UDID `00008132-001C383636B9001C`, iPadOS 27.2)
+**Target OS:** iPadOS 26+ (deployment target 26.0; SpeechAnalyzer requires 26.0; iPadOS 27 APIs noted where relevant)
+**Date:** 2026-04-26 → **v2 refresh 2026-11-25** (SOTA pass: 3 parallel research agents; sources inline)
 
 ---
 
 ## 0. TL;DR — what we're building
 
-A SwiftUI iPad app, **`MLXChat`** (placeholder name — change before App Store submission), that:
+A SwiftUI iPad app, **`MLXChat`**, that:
 
-1. Wraps a **dual-backend** local LLM (Large Language Model) runtime: Apple **MLX (Machine Learning eXchange)** for native MLX-format models, and **`llama.cpp`** for GGUF (GPT-Generated Unified Format) models.
+1. Wraps a **dual-backend** local LLM (Large Language Model) runtime: Apple **MLX (Machine Learning eXchange)** for native MLX-format models, and **`llama.cpp`** (via LocalLLMClient) for GGUF (GPT-Generated Unified Format) models.
 2. Exposes a **single Swift `LLMEngine` protocol** so the rest of the app never sees the backend choice.
-3. Ships with **`mlx-community/Qwen3-8B-4bit-AWQ`** as the default model (~4.7GB on disk, ~5.5GB resident, leaves headroom for a 32k context KV cache plus app overhead inside the iOS Increased Memory Limit ceiling).
-4. Supports **streaming token-by-token UI**, **multi-turn chat with system prompt**, **on-device voice dictation** (`SpeechAnalyzer` on iPadOS 26, `SFSpeechRecognizer` fallback), **runtime model picker / hot-swap**, and a **stub RAG (Retrieval-Augmented Generation) hook**.
-5. Ships an **embedded OpenAI-compatible HTTP server** (Hummingbird 2) bound to `127.0.0.1` so other on-device apps (or your Mac on the same network with a manual port forward) can hit `/v1/chat/completions`.
+3. Ships with **`mlx-community/Qwen3.5-9B-MLX-4bit`** as the default model (~5.95GB on disk; ~6.5–7GB resident; fits the iOS Increased Memory Limit ceiling with headroom). *(Changed 2026-11-25: Qwen3-8B-4bit-AWQ is superseded — 215 downloads vs 23k for Qwen3.5-9B; see §4.)*
+4. Supports **streaming token-by-token UI**, **multi-turn chat with system prompt**, **on-device voice dictation** (`SpeechAnalyzer` + `SpeechTranscriber` on iPadOS 26+, `SFSpeechRecognizer` fallback), **runtime model picker / hot-swap**, and a **stub RAG (Retrieval-Augmented Generation) hook**.
+5. Ships an **embedded OpenAI-compatible HTTP server** (Hummingbird 2) bound to `127.0.0.1` so other on-device apps can hit `/v1/chat/completions`.
 
-**The "generic app interface"** Luke asked about resolves to three concentric layers, all of which are produced as part of this build:
+**The "generic app interface"** resolves to three concentric layers:
 
 | Layer | What | Lives in |
 |---|---|---|
-| **L1 — Swift API** | `LLMEngine` protocol (`func respond(...) async`, `func stream(...) -> AsyncThrowingStream<Token, Error>`) | `MLXChatCore` SPM (Swift Package Manager) target |
+| **L1 — Swift API** | `LLMEngine` protocol (`func respond(...)`, `func stream(...) -> AsyncThrowingStream<GenerationToken, Error>`) | `MLXChatCore` SPM target |
 | **L2 — SwiftUI surface** | `ChatView`, `ModelPickerView`, `VoiceInputBar`, `MessageBubble` | `MLXChat` app target |
 | **L3 — HTTP surface** | `POST /v1/chat/completions` (OpenAI-compatible), `GET /v1/models`, `GET /healthz` | `MLXChatServer` SPM target |
 
@@ -30,140 +30,148 @@ A SwiftUI iPad app, **`MLXChat`** (placeholder name — change before App Store 
 
 ## 1. Hardware reality check (read this before you write any code)
 
-These are the constraints that drive every decision below. Skipping any one of them will bite you on the first model load.
-
 ### 1.1 RAM ceiling
 
-> Sources reviewed: Apple Developer Forums thread #777370 (March 2025), thread #724195 (system limits on iPad-on-Mac apps), Rene Ritchie "Why the iPad Pro Has a 5GB RAM Limit", AppleInsider on iOS 15 entitlement.
-
-- The iPad Pro 11" M4 1TB/2TB tier has **16 GB physical RAM**, **120 GB/s memory bandwidth** (Apple Tech Specs, support.apple.com/en-us/119892).
-- Without the `com.apple.developer.kernel.increased-memory-limit` entitlement, an iPad app is jetsamed at roughly **half of physical RAM** in the worst case, but realistically **~5 GB** on a 16 GB iPad.
-- **With** the entitlement, the *empirically observed* ceiling reported by developers on a 16 GB iPad Pro is **~12 GB**. Apple does **not** document a number; you must call `os_proc_available_memory()` at runtime and treat its return value as authoritative.
-- iPadOS 18 added a `vm-compressor-space-shortage` jetsam reason that fires when your app pushes the VM compressor too hard, even if the headline allocation looks fine. Spiky access patterns (e.g., reading random KV-cache pages) trigger this faster than steady streaming reads.
-- The simulator has no Metal MTLGPUFamily that MLX accepts. **All MLX runs must be on a real device.** Build the UI in the simulator; run inference on hardware.
+- iPad Pro 11" M4 1TB/2TB: **16 GB physical**, **120 GB/s** memory bandwidth.
+- Without `com.apple.developer.kernel.increased-memory-limit`, expect jetsam around **~5 GB**. With it, the empirically observed ceiling on 16 GB iPads is **~12 GB**. Apple does not document a number; call `os_proc_available_memory()` at runtime and treat it as authoritative.
+- **iPadOS 26.4–26.5 regression:** per-app limits on **8 GB** iPads were cut from ~6 GB to ~3 GB (Apple Forums thread 826325; FB22883960). DTS says fixed as of iPadOS 26.6 beta 5. 16 GB M4 iPad largely unaffected — **verify on-device anyway**.
+- iPadOS 18 added `vm-compressor-space-shortage` jetsam reason. Spiky access patterns (random KV-cache pages) trigger it faster than streaming reads.
+- The simulator has no Metal MTLGPUFamily that MLX accepts. **All MLX runs must be on a real device.** Build UI in the simulator; run inference on hardware.
+- **iPadOS 27 note:** Apple Foundation Models (AFM 3 Core) now ships on-device; M4 iPads run AFM 3 Core (see §14). MLX remains the path for custom weights and long context.
 
 ### 1.2 Working memory budget on a 16 GB iPad
 
-Carve up the ~12 GB ceiling honestly:
-
 | Bucket | Reserve | Why |
 |---|---|---|
-| Model weights (Qwen3-8B-4bit-AWQ) | ~5.5 GB resident | The 4.7 GB on-disk file expands during dequantization-aware Metal kernels |
-| KV cache (32k context, 8B model, 4-bit weights, fp16 KV) | ~2.5–3.0 GB | Grows linearly with sequence length |
-| MLX GPU buffer cache | 256 MB | We cap this with `MLX.GPU.set(cacheLimit:)` |
+| Model weights (Qwen3.5-9B-4bit) | ~6.5 GB resident | 5.95 GB on disk + dequant overhead |
+| KV cache (16–32k context) | ~1.5–3.0 GB | TurboQuant KV (see §1.4) shrinks this ~2.7× past ~16k context |
+| MLX GPU buffer cache | 256 MB | `MLX.GPU.set(cacheLimit:)` |
 | Tokenizer + chat template | ~150 MB | swift-transformers overhead |
 | App + SwiftUI + SpeechAnalyzer | ~500 MB | Realistic baseline |
 | Hummingbird HTTP server | ~50 MB | Idle |
 | Headroom for jetsam safety | **~2.5 GB** | Don't skip this |
-| **Total** | **~11–11.5 GB** | Fits inside the entitlement ceiling |
+| **Total** | **~11–12 GB** | Fits inside the entitlement ceiling |
 
 If you hot-swap to a 4B model, you reclaim ~3 GB and can extend context to 64k+.
 
-### 1.3 Why Qwen3-8B-4bit-AWQ specifically
+### 1.3 Why Qwen3.5-9B-MLX-4bit specifically (updated 2026-11-25)
 
-| Candidate | On-disk | Quality (Arena AI / SWE-bench) | Notes |
+| Candidate | On-disk | Quality | Notes |
 |---|---|---|---|
-| **Qwen3-8B-4bit-AWQ** ✅ default | 4.7 GB | Top of the 8B class | AWQ (Activation-aware Weight Quantization) preserves more accuracy than plain 4-bit |
-| Qwen3-8B-4bit-DWQ | 4.7 GB | ≈ AWQ, sometimes slightly better on math | DWQ (Dynamic Weight Quantization) — newer, less battle-tested |
-| Qwen3-8B-4bit | 4.5 GB | Baseline | Use as fallback |
-| Gemma 4 E4B 4-bit | ~5 GB | Strong, 256k context | Good alternative; matches Qwen3-8B on quality, longer context |
-| Qwen2.5-Coder-7B-Instruct-4bit | 4.3 GB | Best for code | Switch to this for coding tasks |
-| Qwen3-4B-4bit | 2.3 GB | Step down | Use if 8B causes jetsam pressure |
-| Gemma 4 E2B 4-bit | ~2 GB | Surprisingly strong | Fast fallback |
+| **Qwen3.5-9B-MLX-4bit** ✅ default | 5.95 GB | MMLU-Pro 82.5, GPQA-D 81.7, IFEval 91.5 | Apache-2.0, multimodal, 262K ctx, thinking-capable, ~20 tok/s on M4 iPad |
+| Qwen3.5-4B-MLX-4bit | 3.03 GB | Strong for size | Fast tier, ~35 tok/s |
+| gemma-4-e4b-it-4bit | 5.15 GB | MMLU-Pro 69.4 | PLE architecture, audio+vision, 128K ctx, Apache-2.0 |
+| gemma-4-e2b-it-4bit | 3.55 GB | MMLU-Pro 60.0 | Ultra-light, ~30–35 tok/s |
+| Qwen3-4B-Instruct-2507-4bit | 2.26 GB | legacy but huge adoption (128k dl) | Non-thinking |
+| Qwen3-8B-4bit | 4.61 GB | legacy | Superseded by Qwen3.5-9B |
+| Qwen3-8B-4bit-AWQ | 4.69 GB | — | **Deprecated**: 215 downloads; MLX never needed AWQ |
+| gpt-oss-20b-MXFP4-Q8 | ~12 GB | strong | Tight on 16 GB; needs recent MLX |
+| Qwen3.5/3.6-35B-A3B, Qwen3-Next-80B | 20–45 GB | — | **Do not fit.** MoE "small active params" does not rescue 16 GB |
 
-### 1.4 The MLX vs Ollama/GGUF reality
+All Qwen3.5 sizes are thinking-capable; disable per-request with `chat_template_kwarg enable_thinking=false` (no `/no_think` soft switch in Qwen3.5).
 
-> Will It Run AI benchmarks (April 2026): MLX is 15–30% faster than llama.cpp on Apple Silicon at the same quantization, with ~10% lower memory overhead. Ollama uses GGUF; MLX uses MLX-format `.safetensors`. The *model* (Qwen3-8B) is identical — only the file format and runtime differ.
+### 1.4 KV cache quantization — TurboQuant (shipped 2026-07-20; **blocked by current pin**)
 
-You said "wrap the optimal local Olama model" — what we actually do is download the **MLX-format** version of the same model family from `mlx-community` on Hugging Face, *plus* keep a `llama.cpp` (GGUF) backend available so you can run any Ollama-compatible model unchanged. The `LLMEngine` protocol abstracts the choice. **Default backend is MLX.** GGUF is opt-in via the model picker.
+`mlx-swift-lm` merged TurboQuant KV-cache compression (PR #232). Opt in via `GenerateParameters.kvScheme`:
+
+- `turbo8v3` — recommended default when enabled: 8-bit affine K + turbo V, ~2.72× KV reduction, KLD ≈ affine8.
+- `turbo0v2/v3/v4` — fp16 K + turbo V (~1.58×), quality play.
+- `affine4/affine8` — 1.88×.
+- Boundary layers (first/last 2) stay 8-bit; rotating/sliding-window layers stay fp16; prompt-cache save/restore works.
+
+> **Availability:** TurboQuant requires mlx-swift-lm ≥ 3.32, which conflicts with LocalLLMClient 0.5.0's swift-syntax 600.x pin. Not usable in v1 of this build; revisit when LocalLLMClient bumps. Rules of thumb (for when it is available): **below ~8–16k context, keep default fp16/affine8 KV — don't bother.** Above ~16k context on 16 GB, `turbo8v3` is what makes 32–64k contexts viable. Decode costs ~0.7–0.8× vs fp16. (Not yet in mlx-lm Python at parity; Swift only, needs mlx-swift-lm ≥ the July 2026 merge — satisfied by 3.33.0.)
+
+### 1.5 The MLX vs Ollama/GGUF reality
+
+MLX is 15–30% faster than llama.cpp on Apple Silicon at the same quantization, with ~10% lower memory overhead. Ollama uses GGUF; MLX uses MLX-format `.safetensors`. Same model family either way. Default backend is MLX; GGUF via LocalLLMClient (0.5.0, llama.cpp b8851) is the fallback path. Best GGUF fallback: `unsloth/Qwen3.5-9B-GGUF` Q4_K_M (5.68 GB).
 
 ---
 
 ## 2. Package architecture
 
-Three SPM packages (Swift Package Manager) in a workspace, plus the iOS app target:
+One Xcode workspace, one local SPM package with five products, plus the iOS app target:
 
 ```
 MLXChat.xcworkspace/
-├── MLXChat.xcodeproj                   # iOS app target (SwiftUI)
+├── MLXChat.xcodeproj                # iOS app target (SwiftUI) — generated by XcodeGen (project.yml)
 └── Packages/
-    ├── MLXChatCore/                    # L1 — Swift API + engines
-    │   ├── Package.swift
-    │   └── Sources/
-    │       ├── MLXChatCore/            # Public protocols, types
-    │       ├── MLXChatEngineMLX/       # MLX backend
-    │       └── MLXChatEngineLlama/     # llama.cpp / GGUF backend
-    ├── MLXChatServer/                  # L3 — Hummingbird HTTP
-    │   ├── Package.swift
-    │   └── Sources/MLXChatServer/
-    └── MLXChatRAG/                     # Stub for vector store / retrieval
+    └── MLXChatPackages/             # single local package, 5 products
         ├── Package.swift
-        └── Sources/MLXChatRAG/
+        └── Sources/
+            ├── MLXChatCore/         # L1 — protocols, types, registry, factory
+            ├── MLXChatEngineMLX/    # MLX backend
+            ├── MLXChatEngineLlama/  # llama.cpp / GGUF backend
+            ├── MLXChatServer/       # L3 — Hummingbird HTTP
+            └── MLXChatRAG/          # Retriever stub
 ```
 
-### 2.1 Top-level dependencies (verified April 26, 2026)
+### 2.1 Top-level dependencies (verified 2026-11-25)
 
-| Dependency | Version | Source | Confirmed |
+| Dependency | Version | Source | Notes |
 |---|---|---|---|
-| `mlx-swift` | `0.25.3+` | `github.com/ml-explore/mlx-swift` | swiftpackageregistry.com, last updated 2026-04-24 |
-| **`mlx-swift-lm`** (new home for LLM/VLM code, replaces `mlx-swift-examples` libraries) | `3.31.3` | `github.com/ml-explore/mlx-swift-lm` | swiftpackageindex.com, released 10 days ago |
-| `LocalLLMClient` | `0.4.6` (or `main`) | `github.com/tattn/LocalLLMClient` | Just merged PR #85 to use mlx-swift-lm |
-| `swift-transformers` | `0.1.14+` | `github.com/huggingface/swift-transformers` | Pulled transitively |
-| `hummingbird` | `2.x` | `github.com/hummingbird-project/hummingbird` | Used by macMLX, SwiftLM |
-| `swift-numerics` | `1.0.3+` | `github.com/apple/swift-numerics` | Pulled transitively |
+| `mlx-swift` | `0.31.3` (pinned) | github.com/ml-explore/mlx-swift | Latest is 0.33.0 (2026-10-27); pinned down — see note |
+| **`mlx-swift-lm`** | **`3.31.3`** (pinned) | github.com/ml-explore/mlx-swift-lm | Latest is 3.33.0 (2026-11-17); pinned down — see note |
+| `swift-huggingface` | `1.0.1` | github.com/huggingface/swift-huggingface | 2026-11-18; `HuggingFace.HubClient` |
+| `swift-transformers` | `1.4.0` | github.com/huggingface/swift-transformers | 2026-11-02; provides `Tokenizers` |
+| `swift-numerics` | `1.1.1` | github.com/apple/swift-numerics | transitive |
+| `LocalLLMClient` | `0.5.0` | github.com/tattn/LocalLLMClient | 2026-04-25; GGUF path; API unstable — pin exact |
+| `hummingbird` | `2.29.0` | github.com/hummingbird-project/hummingbird | 2026-11-19; no 3.x; Swift 6.2+ |
 
-> **Important breaking change:** `mlx-swift-lm` 3.x decoupled from tokenizer/downloader packages. The old `import MLXLLM` from `mlx-swift-examples` is migrating to `import MLXLLM` from `mlx-swift-lm`. The release notes link to migration docs.
+> **Breaking change vs the April 2026 manual:** mlx-swift-lm 3.x is decoupled from tokenizer/downloader packages. You must add `swift-huggingface` + `swift-transformers` yourself and link `MLXHuggingFace`. `import Hub` → `import HuggingFace`; `HubApi` → `HuggingFace.HubClient`; `loadContainer(configuration:)` → `loadContainer(from:using:configuration:)` or the `#huggingFaceLoadModelContainer` macro. See §3.4.
+>
+> **Version pin (2026-11-25, verified by resolution failure):** LocalLLMClient 0.5.0 depends on swift-syntax `600.0.0..<601.0.0`; mlx-swift-lm ≥ 3.31.4 (and 3.32.x/3.33.0) requires swift-syntax `602.0.0..<604.0.0`. They cannot co-resolve. We pin **mlx-swift-lm 3.31.3 + mlx-swift 0.31.3**, the newest pair compatible with LocalLLMClient 0.5.0. Consequences: no TurboQuant KV (`kvScheme`), no `MLXFoundationModels` bridge, no `.reasoning` Generation case until LocalLLMClient bumps swift-syntax (watch tattn/LocalLLMClient releases). Everything else (Swift 6, `#huggingFaceLoadModelContainer`, `generate(input:parameters:context:)` AsyncStream API) is identical.
 
-### 2.2 `MLXChatCore/Package.swift`
+### 2.2 `Packages/MLXChatPackages/Package.swift`
 
 ```swift
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
-    name: "MLXChatCore",
+    name: "MLXChatPackages",
     platforms: [
-        .iOS(.v18),       // Minimum for Increased Memory Limit + MLX
-        .macOS(.v14),     // For dev / catalyst
+        .iOS(.v26),
+        .macOS(.v26),   // dev/catalyst convenience
     ],
     products: [
         .library(name: "MLXChatCore", targets: ["MLXChatCore"]),
         .library(name: "MLXChatEngineMLX", targets: ["MLXChatEngineMLX"]),
         .library(name: "MLXChatEngineLlama", targets: ["MLXChatEngineLlama"]),
+        .library(name: "MLXChatServer", targets: ["MLXChatServer"]),
+        .library(name: "MLXChatRAG", targets: ["MLXChatRAG"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.25.3"),
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", from: "3.31.3"),
-        .package(url: "https://github.com/tattn/LocalLLMClient", from: "0.4.6"),
-        .package(url: "https://github.com/huggingface/swift-transformers", from: "0.1.14"),
+        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.3")),   // pinned: LocalLLMClient 0.5.0 → swift-syntax 600.x
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.31.3")), // pinned: same reason
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "1.0.1"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.4.0"),
+        .package(url: "https://github.com/tattn/LocalLLMClient", exact: "0.5.0"),
+        .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.29.0"),
     ],
     targets: [
-        .target(
-            name: "MLXChatCore",
-            dependencies: [
-                .product(name: "Transformers", package: "swift-transformers"),
-            ]
-        ),
-        .target(
-            name: "MLXChatEngineMLX",
-            dependencies: [
-                "MLXChatCore",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXRandom", package: "mlx-swift"),
-                .product(name: "MLXLLM", package: "mlx-swift-lm"),
-                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
-            ]
-        ),
-        .target(
-            name: "MLXChatEngineLlama",
-            dependencies: [
-                "MLXChatCore",
-                .product(name: "LocalLLMClient", package: "LocalLLMClient"),
-                .product(name: "LocalLLMClientLlama", package: "LocalLLMClient"),
-                .product(name: "LocalLLMClientUtility", package: "LocalLLMClient"),
-            ]
-        ),
+        .target(name: "MLXChatCore", dependencies: [
+            .product(name: "Tokenizers", package: "swift-transformers"),
+        ]),
+        .target(name: "MLXChatEngineMLX", dependencies: [
+            "MLXChatCore",
+            .product(name: "MLX", package: "mlx-swift"),
+            .product(name: "MLXLLM", package: "mlx-swift-lm"),
+            .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+            .product(name: "HuggingFace", package: "swift-huggingface"),
+            .product(name: "Tokenizers", package: "swift-transformers"),
+        ]),
+        .target(name: "MLXChatEngineLlama", dependencies: [
+            "MLXChatCore",
+            .product(name: "LocalLLMClient", package: "LocalLLMClient"),
+            .product(name: "LocalLLMClientLlama", package: "LocalLLMClient"),
+            .product(name: "LocalLLMClientUtility", package: "LocalLLMClient"),
+        ]),
+        .target(name: "MLXChatServer", dependencies: [
+            "MLXChatCore",
+            .product(name: "Hummingbird", package: "hummingbird"),
+        ]),
+        .target(name: "MLXChatRAG", dependencies: ["MLXChatCore"]),
         .testTarget(name: "MLXChatCoreTests", dependencies: ["MLXChatCore"]),
     ],
     swiftLanguageModes: [.v6]
@@ -174,7 +182,7 @@ let package = Package(
 
 ## 3. The generic app interface (L1 — `MLXChatCore`)
 
-This is the protocol every other layer codes against. Both backends conform to it. The HTTP server and the SwiftUI views hold an `any LLMEngine` and never branch on backend.
+Unchanged in spirit from v1; updated for Swift 6.2 approachable concurrency (default `@MainActor` isolation in new app code; engines stay `nonisolated`/actor).
 
 ### 3.1 Public types
 
@@ -190,10 +198,7 @@ public struct ChatMessage: Codable, Sendable, Identifiable, Hashable {
     public let createdAt: Date
 
     public init(id: UUID = UUID(), role: Role, content: String, createdAt: Date = .now) {
-        self.id = id
-        self.role = role
-        self.content = content
-        self.createdAt = createdAt
+        self.id = id; self.role = role; self.content = content; self.createdAt = createdAt
     }
 }
 
@@ -204,6 +209,10 @@ public struct GenerateOptions: Sendable {
     public var topK: Int = 40
     public var repetitionPenalty: Float = 1.1
     public var stopTokens: [String] = []
+    /// nil = model default; set false to disable Qwen3.5 thinking mode per-request
+    public var enableThinking: Bool? = nil
+    /// TurboQuant KV cache scheme for long contexts ("turbo8v3"); nil = default
+    public var kvScheme: String? = nil
     public init() {}
 }
 
@@ -244,7 +253,7 @@ public struct ModelDescriptor: Codable, Sendable, Identifiable, Hashable {
     public let backend: BackendKind
     public let approximateBytesOnDisk: UInt64
     public let recommendedContextWindow: Int
-    public let supportsThinking: Bool   // Qwen3 /think mode
+    public let supportsThinking: Bool
 
     public init(displayName: String,
                 huggingFaceRepo: String,
@@ -275,30 +284,37 @@ public protocol LLMEngine: Actor {
     var isLoaded: Bool { get }
 
     /// Download (if needed) and load the model into memory.
-    /// `progress` reports download progress 0.0...1.0; not called during compile/load.
+    /// `progress` reports download progress 0.0...1.0.
     func load(progress: @Sendable @escaping (Double) -> Void) async throws
 
     /// Free model + KV cache. Idempotent.
     func unload() async
 
-    /// Non-streaming generation. Returns the full response and stats.
+    /// Non-streaming generation.
     func respond(messages: [ChatMessage], options: GenerateOptions) async throws -> (text: String, stats: EngineStats)
 
-    /// Streaming generation. The stream emits tokens as they arrive and a final
-    /// `isFinal: true` token whose `text` is empty after which `EngineStats`
-    /// is available via `lastStats`.
+    /// Streaming generation. Final token carries `isFinal: true` and empty text;
+    /// stats available via `lastStats`.
     func stream(messages: [ChatMessage], options: GenerateOptions) -> AsyncThrowingStream<GenerationToken, Error>
 
-    /// Stats from the most recent `respond` or `stream` call.
     var lastStats: EngineStats? { get }
 }
 ```
 
 ### 3.3 Why an `actor`
 
-Both MLX inference state (`ModelContainer` from mlx-swift-lm) and `LocalLLMClient` are not `Sendable`-safe across raw threads. Wrapping each engine in an actor gives you Swift 6 concurrency safety for free, and it lets the HTTP server, the SwiftUI view, and the voice input pipeline all hold the same engine reference without manual locking. Token streams are explicitly `AsyncThrowingStream` so SwiftUI's `.task { for try await … }` works directly.
+Unchanged: both MLX inference state (`ModelContainer`) and `LocalLLMClient` are not `Sendable`-safe across raw threads. An actor gives Swift 6 concurrency safety; the HTTP server, SwiftUI, and voice pipeline all hold the same reference. Token streams are `AsyncThrowingStream` so `.task { for try await … }` works directly.
 
-### 3.4 The MLX engine implementation
+### 3.4 The MLX engine implementation (API-correct for mlx-swift-lm 3.33)
+
+Key 3.x deltas you must not get wrong:
+
+- `LLMModelFactory.shared.loadContainer(configuration:)` **no longer compiles**. Use `loadContainer(from:using:configuration:)` or the `#huggingFaceLoadModelContainer(configuration:)` macro.
+- `import HuggingFace` (not `Hub`); `HubApi` → `HuggingFace.HubClient`.
+- `tokenizer.decode(tokens:)` → `tokenizer.decode(tokenIds:)`.
+- `ModelConfiguration(id:)` still valid; `tokenizerId:`/`overrideTokenizer:` → `tokenizerSource:`; `preparePrompt` removed.
+- `UserInput.Image/Video/Audio` are structs with a nested `Source` enum.
+- Add `swift-huggingface` + `swift-transformers` yourself; link `MLXHuggingFace` for the macros.
 
 ```swift
 // Sources/MLXChatEngineMLX/MLXEngine.swift
@@ -306,6 +322,9 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXHuggingFace
+import HuggingFace
+import Tokenizers
 import MLXChatCore
 
 public actor MLXEngine: LLMEngine {
@@ -315,9 +334,7 @@ public actor MLXEngine: LLMEngine {
 
     private var container: ModelContainer?
 
-    /// Buffer cache cap: 256 MB is the empirical sweet spot for 8B models on
-    /// 16 GB iPads — large enough to amortize Metal allocator churn, small
-    /// enough that it doesn't squeeze the KV cache.
+    /// Buffer cache cap: 256 MB is the empirical sweet spot on 16 GB iPads.
     private static let gpuCacheLimitBytes = 256 * 1024 * 1024
 
     public init(descriptor: ModelDescriptor) {
@@ -328,13 +345,10 @@ public actor MLXEngine: LLMEngine {
     public func load(progress: @Sendable @escaping (Double) -> Void) async throws {
         guard !isLoaded else { return }
 
-        // Cap the buffer cache BEFORE loading so the loader doesn't fight
-        // for memory.
         MLX.GPU.set(cacheLimit: Self.gpuCacheLimitBytes)
 
-        // Pre-flight: do we have headroom?
         let available = os_proc_available_memory()
-        let required = UInt64(Double(descriptor.approximateBytesOnDisk) * 1.4) // ~40% expansion
+        let required = UInt64(Double(descriptor.approximateBytesOnDisk) * 1.4)
         guard UInt64(available) >= required else {
             throw EngineError.insufficientMemory(
                 availableBytes: UInt64(available),
@@ -342,12 +356,12 @@ public actor MLXEngine: LLMEngine {
             )
         }
 
-        let configuration = ModelConfiguration(
-            id: descriptor.huggingFaceRepo
-        )
+        let configuration = ModelConfiguration(id: descriptor.huggingFaceRepo)
 
         do {
             self.container = try await LLMModelFactory.shared.loadContainer(
+                from: #hubDownloader(),
+                using: #huggingFaceTokenizerLoader(),
                 configuration: configuration
             ) { p in
                 progress(p.fractionCompleted)
@@ -369,8 +383,7 @@ public actor MLXEngine: LLMEngine {
         options: GenerateOptions
     ) async throws -> (text: String, stats: EngineStats) {
         var collected = ""
-        let stream = self.stream(messages: messages, options: options)
-        for try await token in stream {
+        for try await token in stream(messages: messages, options: options) {
             collected += token.text
         }
         guard let stats = lastStats else {
@@ -386,11 +399,7 @@ public actor MLXEngine: LLMEngine {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    try await self._stream(
-                        messages: messages,
-                        options: options,
-                        continuation: continuation
-                    )
+                    try await self._stream(messages: messages, options: options, continuation: continuation)
                 } catch {
                     continuation.finish(throwing: error)
                 }
@@ -404,28 +413,29 @@ public actor MLXEngine: LLMEngine {
         options: GenerateOptions,
         continuation: AsyncThrowingStream<GenerationToken, Error>.Continuation
     ) async throws {
-        guard let container = self.container else {
-            throw EngineError.modelNotLoaded
-        }
+        guard let container else { throw EngineError.modelNotLoaded }
 
         let userInput = UserInput(
-            messages: messages.map { msg in
-                ["role": msg.role.rawValue, "content": msg.content]
-            }
+            messages: messages.map { ["role": $0.role.rawValue, "content": $0.content] }
         )
 
-        let parameters = GenerateParameters(
+        var parameters = GenerateParameters(
             temperature: options.temperature,
             topP: options.topP,
             repetitionPenalty: options.repetitionPenalty
         )
+        if let kv = options.kvScheme {
+            // TurboQuant: only worth it past ~16k context
+            // parameters.kvScheme = .turbo8v3   // exact API per MLXLMCommon docs
+            _ = kv
+        }
 
         let startTime = ContinuousClock.now
         var promptTokenCount = 0
         var completionTokenCount = 0
         var generationStarted: ContinuousClock.Instant?
 
-        try await container.perform { [weak self] context in
+        try await container.perform { context in
             let input = try await context.processor.prepare(input: userInput)
             promptTokenCount = input.text.tokens.size
 
@@ -435,23 +445,18 @@ public actor MLXEngine: LLMEngine {
                 context: context
             ) { tokens in
                 if generationStarted == nil { generationStarted = .now }
-                let newText = context.tokenizer.decode(tokens: tokens)
-                continuation.yield(GenerationToken(
-                    text: newText,
-                    tokenIndex: completionTokenCount,
-                    isFinal: false
-                ))
+                let newText = context.tokenizer.decode(tokenIds: tokens)
+                continuation.yield(GenerationToken(text: newText,
+                                                    tokenIndex: completionTokenCount,
+                                                    isFinal: false))
                 completionTokenCount += 1
                 return completionTokenCount >= options.maxTokens ? .stop : .more
             }
         }
 
         let endTime = ContinuousClock.now
-        let totalDuration = startTime.duration(to: endTime)
-        let promptDuration = generationStarted.map { startTime.duration(to: $0) }
-            ?? totalDuration
-        let completionDuration = generationStarted.map { $0.duration(to: endTime) }
-            ?? .seconds(0)
+        let promptDuration = generationStarted.map { startTime.duration(to: $0) } ?? .zero
+        let completionDuration = generationStarted.map { $0.duration(to: endTime) } ?? .zero
 
         let stats = EngineStats(
             promptTokens: promptTokenCount,
@@ -485,175 +490,15 @@ public actor MLXEngine: LLMEngine {
 }
 ```
 
+> `kvScheme` wiring: check `GenerateParameters` in the installed mlx-swift-lm 3.33.0 for the exact `kvScheme` property name before enabling; keep it behind `GenerateOptions.kvScheme` and default off. The `ChatSession` API (`streamResponse(to:)`) is an equally valid simpler path if you don't need per-token control — see the `MLXChatExample` in mlx-swift-examples.
+
 ### 3.5 The llama.cpp engine implementation
 
-```swift
-// Sources/MLXChatEngineLlama/LlamaEngine.swift
-import Foundation
-import LocalLLMClient
-import LocalLLMClientLlama
-import LocalLLMClientUtility
-import MLXChatCore
-
-public actor LlamaEngine: LLMEngine {
-    public nonisolated let descriptor: ModelDescriptor
-    public private(set) var isLoaded: Bool = false
-    public private(set) var lastStats: EngineStats?
-
-    private var session: LLMSession?
-
-    public init(descriptor: ModelDescriptor) {
-        precondition(descriptor.backend == .llamaCpp, "LlamaEngine requires .llamaCpp backend")
-        precondition(descriptor.filename != nil, "GGUF requires explicit filename")
-        self.descriptor = descriptor
-    }
-
-    public func load(progress: @Sendable @escaping (Double) -> Void) async throws {
-        guard !isLoaded else { return }
-        guard let filename = descriptor.filename else {
-            throw EngineError.modelLoadFailed(underlying: "missing GGUF filename")
-        }
-
-        let model = LLMSession.DownloadModel.llama(
-            id: descriptor.huggingFaceRepo,
-            model: filename,
-            parameter: .init(
-                context: descriptor.recommendedContextWindow,
-                temperature: 0.7,
-                topK: 40,
-                topP: 0.9
-            )
-        )
-
-        do {
-            try await model.downloadModel { p in progress(p) }
-            self.session = LLMSession(model: model)
-            self.isLoaded = true
-        } catch {
-            throw EngineError.modelLoadFailed(underlying: String(describing: error))
-        }
-    }
-
-    public func unload() async {
-        session = nil
-        isLoaded = false
-    }
-
-    public func respond(
-        messages: [ChatMessage],
-        options: GenerateOptions
-    ) async throws -> (text: String, stats: EngineStats) {
-        guard let session else { throw EngineError.modelNotLoaded }
-        session.messages = messages.map(toLLMMessage)
-        let userPrompt = messages.last(where: { $0.role == .user })?.content ?? ""
-        let start = ContinuousClock.now
-        let text = try await session.respond(to: userPrompt)
-        let duration = start.duration(to: .now)
-        let stats = EngineStats(
-            promptTokens: 0, // LocalLLMClient doesn't surface token counts yet
-            completionTokens: text.count / 4, // rough heuristic
-            promptTokensPerSecond: 0,
-            completionTokensPerSecond: tps(text.count / 4, duration),
-            peakResidentMemoryBytes: 0
-        )
-        self.lastStats = stats
-        return (text, stats)
-    }
-
-    public nonisolated func stream(
-        messages: [ChatMessage],
-        options: GenerateOptions
-    ) -> AsyncThrowingStream<GenerationToken, Error> {
-        AsyncThrowingStream { continuation in
-            let task = Task {
-                do {
-                    try await self._stream(messages: messages, options: options, continuation: continuation)
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
-    }
-
-    private func _stream(
-        messages: [ChatMessage],
-        options: GenerateOptions,
-        continuation: AsyncThrowingStream<GenerationToken, Error>.Continuation
-    ) async throws {
-        guard let session else { throw EngineError.modelNotLoaded }
-        session.messages = messages.map(toLLMMessage)
-        let userPrompt = messages.last(where: { $0.role == .user })?.content ?? ""
-
-        var index = 0
-        let start = ContinuousClock.now
-        for try await chunk in session.streamResponse(to: userPrompt) {
-            continuation.yield(GenerationToken(text: chunk, tokenIndex: index, isFinal: false))
-            index += 1
-        }
-        let duration = start.duration(to: .now)
-        self.lastStats = EngineStats(
-            promptTokens: 0,
-            completionTokens: index,
-            promptTokensPerSecond: 0,
-            completionTokensPerSecond: tps(index, duration),
-            peakResidentMemoryBytes: 0
-        )
-        continuation.yield(GenerationToken(text: "", tokenIndex: index, isFinal: true))
-        continuation.finish()
-    }
-
-    private func toLLMMessage(_ msg: ChatMessage) -> LLMSession.Message {
-        switch msg.role {
-        case .system: return .system(msg.content)
-        case .user: return .user(msg.content)
-        case .assistant: return .assistant(msg.content)
-        }
-    }
-
-    private func tps(_ tokens: Int, _ duration: Duration) -> Double {
-        let seconds = Double(duration.components.seconds) +
-            Double(duration.components.attoseconds) / 1e18
-        return seconds > 0 ? Double(tokens) / seconds : 0
-    }
-}
-```
+Unchanged from v1 except version pin: **LocalLLMClient 0.5.0** (2026-04-25; llama.cpp b8851; Gemma 4 supported; API explicitly unstable — pin `exact: "0.5.0"`). GGUF fallback model: `unsloth/Qwen3.5-9B-GGUF` Q4_K_M (5.68 GB).
 
 ### 3.6 Engine factory
 
-```swift
-// Sources/MLXChatCore/EngineFactory.swift
-import Foundation
-
-public enum EngineFactory {
-    /// Build the right engine for a descriptor. Caller decides whether to
-    /// `await engine.load(...)` immediately or lazily.
-    public static func make(_ descriptor: ModelDescriptor) -> any LLMEngine {
-        switch descriptor.backend {
-        case .mlx:
-            // Resolved via runtime require; if MLXChatEngineMLX isn't linked,
-            // this is a programmer error.
-            return _makeMLX(descriptor)
-        case .llamaCpp:
-            return _makeLlama(descriptor)
-        }
-    }
-}
-
-// In MLXChatEngineMLX (file scope):
-import MLXChatEngineMLX
-@_cdecl("mlxchat_make_mlx") public func _makeMLX(_ d: ModelDescriptor) -> any LLMEngine {
-    MLXEngine(descriptor: d)
-}
-
-// In MLXChatEngineLlama (file scope):
-import MLXChatEngineLlama
-@_cdecl("mlxchat_make_llama") public func _makeLlama(_ d: ModelDescriptor) -> any LLMEngine {
-    LlamaEngine(descriptor: d)
-}
-```
-
-> **Note:** The `@_cdecl` trick is one option; alternatively, just import both engine modules from the app target and resolve via a switch. Pick whichever you prefer. The simpler approach for an iOS app:
+Use the simple in-app switch (drop the `@_cdecl` idea):
 
 ```swift
 // In the app target:
@@ -671,74 +516,83 @@ func makeEngine(_ d: ModelDescriptor) -> any LLMEngine {
 
 ---
 
-## 4. The model registry
+## 4. The model registry (updated 2026-11-25)
 
 ```swift
 // Sources/MLXChatCore/ModelCatalog.swift
 public enum ModelCatalog {
-    public static let qwen3_8B_4bit_AWQ = ModelDescriptor(
-        displayName: "Qwen3-8B (AWQ 4-bit, MLX)",
-        huggingFaceRepo: "mlx-community/Qwen3-8B-4bit-AWQ",
+    public static let qwen35_9B_4bit = ModelDescriptor(
+        displayName: "Qwen3.5 9B (4-bit, MLX)",
+        huggingFaceRepo: "mlx-community/Qwen3.5-9B-MLX-4bit",
         backend: .mlx,
-        approximateBytesOnDisk: 4_700_000_000,
+        approximateBytesOnDisk: 5_950_000_000,
         recommendedContextWindow: 32_768,
         supportsThinking: true
     )
-    public static let qwen3_8B_4bit = ModelDescriptor(
-        displayName: "Qwen3-8B (4-bit, MLX)",
-        huggingFaceRepo: "mlx-community/Qwen3-8B-4bit",
+    public static let qwen35_4B_4bit = ModelDescriptor(
+        displayName: "Qwen3.5 4B (4-bit, MLX)",
+        huggingFaceRepo: "mlx-community/Qwen3.5-4B-MLX-4bit",
         backend: .mlx,
-        approximateBytesOnDisk: 4_500_000_000,
+        approximateBytesOnDisk: 3_030_000_000,
         recommendedContextWindow: 32_768,
         supportsThinking: true
-    )
-    public static let qwen3_4B_4bit = ModelDescriptor(
-        displayName: "Qwen3-4B (4-bit, MLX)",
-        huggingFaceRepo: "mlx-community/Qwen3-4B-Instruct-2507-4bit",
-        backend: .mlx,
-        approximateBytesOnDisk: 2_300_000_000,
-        recommendedContextWindow: 32_768,
-        supportsThinking: false
     )
     public static let gemma4_E4B_4bit = ModelDescriptor(
         displayName: "Gemma 4 E4B (4-bit, MLX)",
         huggingFaceRepo: "mlx-community/gemma-4-e4b-it-4bit",
         backend: .mlx,
-        approximateBytesOnDisk: 5_000_000_000,
+        approximateBytesOnDisk: 5_150_000_000,
         recommendedContextWindow: 65_536,
-        supportsThinking: false
+        supportsThinking: true
     )
-    public static let qwen2_5_Coder_7B_4bit = ModelDescriptor(
-        displayName: "Qwen2.5-Coder-7B (4-bit, MLX)",
-        huggingFaceRepo: "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+    public static let gemma4_E2B_4bit = ModelDescriptor(
+        displayName: "Gemma 4 E2B (4-bit, MLX)",
+        huggingFaceRepo: "mlx-community/gemma-4-e2b-it-4bit",
         backend: .mlx,
-        approximateBytesOnDisk: 4_300_000_000,
+        approximateBytesOnDisk: 3_550_000_000,
+        recommendedContextWindow: 32_768,
+        supportsThinking: true
+    )
+    public static let qwen3_8B_4bit = ModelDescriptor(
+        displayName: "Qwen3 8B (4-bit, MLX) — legacy",
+        huggingFaceRepo: "mlx-community/Qwen3-8B-4bit",
+        backend: .mlx,
+        approximateBytesOnDisk: 4_610_000_000,
+        recommendedContextWindow: 32_768,
+        supportsThinking: true
+    )
+    public static let qwen3_4B_Instruct = ModelDescriptor(
+        displayName: "Qwen3 4B Instruct 2507 (4-bit, MLX)",
+        huggingFaceRepo: "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+        backend: .mlx,
+        approximateBytesOnDisk: 2_260_000_000,
         recommendedContextWindow: 32_768,
         supportsThinking: false
     )
-    // GGUF (llama.cpp) fallback — same model family as the user's Ollama setup
-    public static let qwen3_8B_GGUF = ModelDescriptor(
-        displayName: "Qwen3-8B (Q4_K_M, GGUF)",
-        huggingFaceRepo: "lmstudio-community/Qwen3-8B-GGUF",
-        filename: "Qwen3-8B-Q4_K_M.gguf",
+    // GGUF (llama.cpp) fallback — same family as Ollama setups
+    public static let qwen35_9B_GGUF = ModelDescriptor(
+        displayName: "Qwen3.5 9B (Q4_K_M, GGUF)",
+        huggingFaceRepo: "unsloth/Qwen3.5-9B-GGUF",
+        filename: "Qwen3.5-9B-Q4_K_M.gguf",
         backend: .llamaCpp,
-        approximateBytesOnDisk: 4_900_000_000,
+        approximateBytesOnDisk: 5_680_000_000,
         recommendedContextWindow: 32_768,
         supportsThinking: true
     )
 
     public static let all: [ModelDescriptor] = [
-        qwen3_8B_4bit_AWQ,
-        qwen3_8B_4bit,
-        qwen3_4B_4bit,
-        gemma4_E4B_4bit,
-        qwen2_5_Coder_7B_4bit,
-        qwen3_8B_GGUF,
+        qwen35_9B_4bit, qwen35_4B_4bit, gemma4_E4B_4bit, gemma4_E2B_4bit,
+        qwen3_8B_4bit, qwen3_4B_Instruct, qwen35_9B_GGUF,
     ]
 
-    public static let `default` = qwen3_8B_4bit_AWQ
+    public static let `default` = qwen35_9B_4bit
 }
 ```
+
+Notes:
+- Qwen3.5 thinking is on by default; send `chat_template_kwarg enable_thinking=false` for snappy non-thinking replies.
+- MoE models (Qwen3.5/3.6-35B-A3B, Qwen3-Next-80B) do **not** fit 16 GB — do not add them.
+- Gemma 4 E4B/E2B support audio input — future voice-in path that skips the speech pipeline.
 
 ---
 
@@ -755,260 +609,132 @@ public enum ModelCatalog {
     <true/>
     <key>com.apple.developer.kernel.extended-virtual-addressing</key>
     <true/>
-    <key>com.apple.security.app-sandbox</key>
-    <true/>
-    <key>com.apple.security.network.client</key>
-    <true/>
-    <key>com.apple.security.network.server</key>
-    <true/>
 </dict>
 </plist>
 ```
 
-In Xcode: `Signing & Capabilities` → `+ Capability` → add **Increased Memory Limit**, **Extended Virtual Addressing**, **App Sandbox**, **Background Modes** (check `Audio` for voice and `Background fetch` for download resumption).
+App Sandbox is implicit on iOS (no sandbox entitlement key needed). In Xcode: Signing & Capabilities → + Capability → **Increased Memory Limit**, **Extended Virtual Addressing**, **Background Modes** (`audio` for voice, `fetch` for downloads).
+
+> **Distribution gotcha:** the memory entitlement must be present in the **distribution** profile too. Verify with `codesign -d --entitlements :- <App.app>` on the archive. Missing from distribution = jetsam at ~6 GB in TestFlight/App Store while dev builds look fine.
 
 ### 5.2 `Info.plist` keys
 
 | Key | Value | Why |
 |---|---|---|
-| `NSMicrophoneUsageDescription` | `MLXChat uses your microphone for on-device voice dictation. Your voice never leaves the device.` | Required for `SpeechAnalyzer` and `AVAudioRecorder` |
-| `NSSpeechRecognitionUsageDescription` | `MLXChat transcribes your speech entirely on-device.` | Required even for `SpeechAnalyzer` per Apple guidance |
-| `UIBackgroundModes` | `audio`, `fetch` | Continue dictation through interruptions; resume model download |
-| `NSAppTransportSecurity` → `NSAllowsLocalNetworking` | `true` | For the local Hummingbird server |
-| `LSApplicationQueriesSchemes` | (empty) | Defensive |
-| `UIRequiredDeviceCapabilities` | `arm64` | Excludes simulator from App Store |
+| `NSMicrophoneUsageDescription` | `MLXChat uses your microphone for on-device voice dictation. Your voice never leaves the device.` | Required for SpeechAnalyzer (this is the *only* speech-related key it needs) |
+| `NSSpeechRecognitionUsageDescription` | `MLXChat transcribes your speech entirely on-device.` | Only if shipping the SFSpeechRecognizer fallback |
+| `UIBackgroundModes` | `audio`, `fetch` | Dictation through interruptions; background model download |
+| `NSAppTransportSecurity` → `NSAllowsLocalNetworking` | `true` | Only if you later add LAN fetch; loopback needs nothing |
+| `ITSAppUsesNonExemptEncryption` | `NO` | Standard HTTPS/TLS only — skips export-compliance questionnaire |
+| `UIRequiredDeviceCapabilities` | `arm64` | Excludes simulator |
+| `LSApplicationQueriesSchemes` | (omit) | Not needed |
+
+Loopback (`127.0.0.1`) HTTP needs **no** Local Network permission (TN3179). LAN access (e.g. reaching a Mac Ollama) would require `NSLocalNetworkUsageDescription` — not in v1 scope.
 
 ### 5.3 Build settings
 
 | Setting | Value | Why |
 |---|---|---|
-| `EXCLUDED_ARCHS` (iOS Simulator) | `x86_64 arm64` | MLX Metal kernels do not run in the simulator. Build only the UI on simulator if you need it |
-| `SWIFT_STRICT_CONCURRENCY` | `complete` | Future-proofs you for Swift 6 |
-| `IPHONEOS_DEPLOYMENT_TARGET` | `18.0` (or `26.0` for SpeechAnalyzer-only) | See §7 for the speech fallback story |
-| `OTHER_SWIFT_FLAGS` (Release) | `-O -whole-module-optimization` | Default but verify; MLX inference is hot-loop dominated |
+| `EXCLUDED_ARCHS` (iOS Simulator) | `x86_64 arm64` | MLX Metal kernels don't run in the simulator |
+| `SWIFT_STRICT_CONCURRENCY` | `complete` | Swift 6 |
+| `IPHONEOS_DEPLOYMENT_TARGET` | `26.0` | SpeechAnalyzer floor; bump to 27.0 to unlock AFM 3 / `MLXFoundationModels` |
+| `SWIFT_APPROACHABLE_CONCURRENCY` | `YES` | New-template default in Xcode 26+/27 (SE-0466/SE-0461) |
+| `SWIFT_DEFAULT_ACTOR_ISOLATION` | `MainActor` | New-template default; engines stay explicitly `nonisolated`/actor |
+| `OTHER_SWIFT_FLAGS` (Release) | `-O -whole-module-optimization` | Default; verify |
 
 ### 5.4 App lifecycle gotchas
 
-- **Don't load the model in `App.init`.** SwiftUI calls `init` early, before SwiftUI scenes attach; throwing there crashes silently. Load on first `.task` of the root view.
-- **Don't run inference on the main thread.** The actor handles this for you. Any `ProgressView` updates from a streaming closure must `await MainActor.run { ... }` if you're not already in `.task`.
-- **`MLX.GPU.set(cacheLimit:)` must be called *before* the first MLX op.** Put it in your engine's `load()`, not in app startup. Calling it once is enough; it's process-wide.
+- **Don't load the model in `App.init`.** Load in the root view's `.task`.
+- **Don't run inference on the main thread.** The actor handles it; streaming UI hops to `@MainActor`.
+- **`MLX.GPU.set(cacheLimit:)` before the first MLX op** — inside `load()`, not app startup.
+- **Swift 6.2 / Xcode 27:** new templates default to MainActor isolation + `nonisolated(nonsending)`. Keep MLX work in actors/`@concurrent` functions, never on MainActor.
 
 ---
 
 ## 6. SwiftUI surface (L2)
 
-The view hierarchy for v1:
+Unchanged structurally from v1. Key updates:
 
-```
-RootView
-├── ChatView (default tab)
-│   ├── MessageListView
-│   │   └── MessageBubble (role-styled)
-│   ├── StatsBar (optional, shows tok/s + memory)
-│   └── ComposerView
-│       ├── TextField
-│       └── VoiceInputButton  →  VoiceInputBar (sheet)
-├── ModelPickerView (settings sheet)
-│   └── ModelRow (descriptor + downloaded? + size)
-└── ServerControlView (settings sheet)
-    └── Local HTTP toggle, port, requests log
-```
+- `@MainActor @Observable` view models (Observation framework) — no `ObservableObject`/`@Published`.
+- Split state: `messages: [ChatMessage]` (finished) + `streamingText: String` (in-flight) + `generationID: UUID` to discard stale streams.
+- `ScrollViewReader` + `.onChange(of: streamingText)` to pin to bottom.
+- `.task` on the chat view for load; `.task(id:)` cancellation for streams.
 
-### 6.1 The view model
+### 6.1 ChatViewModel (v2 sketch)
 
 ```swift
-// MLXChat/ChatViewModel.swift
-import Foundation
-import MLXChatCore
-import MLXChatEngineMLX
-import MLXChatEngineLlama
-import Observation
-
-@MainActor
-@Observable
-public final class ChatViewModel {
-    public var messages: [ChatMessage] = [
+@MainActor @Observable
+final class ChatViewModel {
+    var messages: [ChatMessage] = [
         .init(role: .system, content: "You are a helpful, concise assistant.")
     ]
-    public var input: String = ""
-    public var isGenerating: Bool = false
-    public var loadProgress: Double = 0
-    public var loadState: LoadState = .idle
-    public var stats: EngineStats?
-    public var selectedModel: ModelDescriptor = ModelCatalog.default
+    var input = ""
+    var isGenerating = false
+    var loadState: LoadState = .idle
+    var stats: EngineStats?
+    var selectedModel: ModelDescriptor = ModelCatalog.default
+    private(set) var streamingText = ""
 
-    public enum LoadState: Equatable {
-        case idle
-        case downloading(Double)
-        case loading
-        case ready
-        case failed(String)
+    enum LoadState: Equatable {
+        case idle, downloading(Double), loading, ready, failed(String)
     }
 
     private var engine: (any LLMEngine)?
+    private var generationTask: Task<Void, Never>?
 
-    public init() {}
+    func ensureLoaded() async { /* as v1: create engine, load, set .ready */ }
+    func switchModel(to descriptor: ModelDescriptor) async { /* unload, swap, reload */ }
 
-    public func ensureLoaded() async {
-        if case .ready = loadState, engine?.descriptor == selectedModel { return }
-        loadState = .loading
-        let new: any LLMEngine = {
-            switch selectedModel.backend {
-            case .mlx:      return MLXEngine(descriptor: selectedModel)
-            case .llamaCpp: return LlamaEngine(descriptor: selectedModel)
-            }
-        }()
-        do {
-            try await new.load { [weak self] p in
-                Task { @MainActor in self?.loadState = .downloading(p) }
-            }
-            self.engine = new
-            self.loadState = .ready
-        } catch {
-            self.loadState = .failed(String(describing: error))
-        }
-    }
-
-    public func switchModel(to descriptor: ModelDescriptor) async {
-        guard descriptor != selectedModel else { return }
-        await engine?.unload()
-        engine = nil
-        selectedModel = descriptor
-        loadState = .idle
-        await ensureLoaded()
-    }
-
-    public func send() async {
+    func send() {
         let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isGenerating, let engine else { return }
-
         messages.append(.init(role: .user, content: trimmed))
         input = ""
-        var assistant = ChatMessage(role: .assistant, content: "")
-        messages.append(assistant)
         isGenerating = true
-        defer { isGenerating = false }
-
-        let stream = engine.stream(
-            messages: messages.dropLast(), // omit the empty placeholder
-            options: GenerateOptions()
-        )
-        do {
-            for try await token in stream {
-                if token.isFinal { break }
-                assistant.content += token.text
-                messages[messages.count - 1] = assistant
+        streamingText = ""
+        let history = messages
+        generationTask = Task {
+            do {
+                for try await token in engine.stream(messages: history, options: GenerateOptions()) {
+                    if token.isFinal { break }
+                    streamingText += token.text
+                }
+                messages.append(.init(role: .assistant, content: streamingText))
+                streamingText = ""
+                stats = await engine.lastStats
+            } catch {
+                messages.append(.init(role: .assistant, content: "⚠️ \(error)"))
             }
-            self.stats = await engine.lastStats
-        } catch {
-            assistant.content = "⚠️ \(error)"
-            messages[messages.count - 1] = assistant
+            isGenerating = false
         }
     }
 
-    public func cancelGeneration() {
-        // The stream's onTermination cancels the underlying task.
-        // Nothing else to do here in v1.
-    }
+    func cancelGeneration() { generationTask?.cancel(); isGenerating = false }
 }
 ```
 
-### 6.2 ChatView
+### 6.2 Views
 
-```swift
-// MLXChat/ChatView.swift
-import SwiftUI
-import MLXChatCore
-
-struct ChatView: View {
-    @State private var viewModel = ChatViewModel()
-    @State private var showModelPicker = false
-
-    var body: some View {
-        NavigationStack {
-            VStack(spacing: 0) {
-                if case .ready = viewModel.loadState {
-                    MessageListView(messages: viewModel.messages.filter { $0.role != .system })
-                    Divider()
-                    if let stats = viewModel.stats {
-                        StatsBar(stats: stats)
-                    }
-                    ComposerView(
-                        input: $viewModel.input,
-                        isGenerating: viewModel.isGenerating,
-                        onSend: { Task { await viewModel.send() } }
-                    )
-                } else {
-                    LoadingView(state: viewModel.loadState)
-                }
-            }
-            .navigationTitle(viewModel.selectedModel.displayName)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Models", systemImage: "cpu") { showModelPicker = true }
-                }
-            }
-            .sheet(isPresented: $showModelPicker) {
-                ModelPickerView(viewModel: viewModel)
-            }
-            .task { await viewModel.ensureLoaded() }
-        }
-    }
-}
-```
-
-### 6.3 Streaming UX detail
-
-The `ChatViewModel.send()` above mutates `messages[last].content` on every token. SwiftUI's diffing handles this efficiently *only* if the message struct is `Hashable` and `Identifiable` (we made it both). The visible effect is the assistant bubble growing token by token. There's no separate "typing indicator" needed — the bubble itself is the indicator.
-
-If you want a blinking cursor while generating, append `▎` to the content while `isGenerating` and strip it on completion.
-
-### 6.4 Model picker
-
-```swift
-struct ModelPickerView: View {
-    let viewModel: ChatViewModel
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            List {
-                ForEach(ModelCatalog.all) { model in
-                    Button {
-                        Task {
-                            await viewModel.switchModel(to: model)
-                            dismiss()
-                        }
-                    } label: {
-                        ModelRow(
-                            descriptor: model,
-                            isSelected: model == viewModel.selectedModel
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-            } header: {
-                Text("Selecting a different model unloads the current one and downloads the new one if needed. ~10s on a fast connection for an already-cached model.")
-            }
-            .navigationTitle("Models")
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
-        }
-    }
-}
-```
+`ChatView` / `ModelPickerView` / `MessageBubble` / `StatsBar` / `ComposerView` as in v1, with the streaming text rendered from `streamingText` instead of mutating the last message per token. Blinking cursor: append `▎` while `isGenerating`.
 
 ---
 
-## 7. Voice input (Speech.framework)
+## 7. Voice input (Speech framework) — iPadOS 26+ path is now the shipping path
 
-Two paths, gated by deployment target.
+### 7.1 `SpeechAnalyzer` + `SpeechTranscriber` (preferred, iPadOS 26+)
 
-### 7.1 iPadOS 26+ — `SpeechAnalyzer` (preferred)
+As of iPadOS 26 this is shipping and is what Apple uses in Notes. iPadOS 27 adds `CaptureInputSequenceProvider`, `AssetInputSequenceProvider`, and `AnalyzerInputConverter` (convenience input plumbing) — use them if you gate on 27.
 
-> Apple's iOS 26 SpeechAnalyzer + SpeechTranscriber: on-device, long-form, low-latency, distant-mic capable, model lives outside your app's memory space (no impact on app size or memory budget).
+Key facts (verified 2026-11-25):
+
+- On-device only, no server path, no 1-minute cap, system-managed model assets (zero app bundle/memory cost), long-form + far-field.
+- Needs **only** `NSMicrophoneUsageDescription`. No speech-recognition authorization, no `NSSpeechRecognitionUsageDescription`.
+- `SpeechTranscriber` has **no** `contextualStrings`; use `DictationTranscriber` with `AnalysisContext.contextualStrings` if you need custom vocabulary.
+- Results arrive via `AsyncSequence` with `isFinal` flags; `result.text` is an `AttributedString`.
+- `SpeechTranscriber.supportedLocales` / `installedLocales`; install via `AssetInventory.assetInstallationRequest(supporting:)`.
 
 ```swift
-// MLXChat/Voice/SpeechAnalyzerDictation.swift
+// MLXChat/Voice/SpeechAnalyzerDictation.swift  (iPadOS 26+)
 import Foundation
 import Speech
 import AVFoundation
@@ -1016,7 +742,7 @@ import AVFoundation
 @available(iOS 26.0, *)
 @MainActor
 final class SpeechAnalyzerDictation: ObservableObject {
-    @Published var transcript: String = ""
+    @Published var transcript = ""
     @Published var isListening = false
 
     private var analyzer: SpeechAnalyzer?
@@ -1024,33 +750,31 @@ final class SpeechAnalyzerDictation: ObservableObject {
     private var inputBuilder: AsyncStream<AnalyzerInput>.Continuation?
     private var format: AVAudioFormat?
     private let audioEngine = AVAudioEngine()
-    private let converter = BufferConverter() // helper, see Apple's sample
 
     func start() async throws {
-        guard await requestAuthorization() else { return }
+        guard await AVAudioApplication.requestRecordPermission() else { return }
 
         let transcriber = SpeechTranscriber(
             locale: .current,
             preset: .progressiveLiveTranscription
         )
-        try await ensureModel(for: transcriber, locale: .current)
+        try await ensureModel(for: transcriber)
 
         let analyzer = SpeechAnalyzer(modules: [transcriber])
         self.analyzer = analyzer
         self.transcriber = transcriber
         self.format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
 
-        let (inputSequence, builder) = AsyncStream<AnalyzerInput>.makeStream()
+        let (stream, builder) = AsyncStream<AnalyzerInput>.makeStream()
         self.inputBuilder = builder
 
         Task { @MainActor in
             for try await result in transcriber.results {
-                let text = String(result.text.characters)
-                self.transcript = text
+                self.transcript = String(result.text.characters)
             }
         }
 
-        try await analyzer.start(inputSequence: inputSequence)
+        try await analyzer.start(inputSequence: stream)
         try startMic()
         isListening = true
     }
@@ -1059,9 +783,8 @@ final class SpeechAnalyzerDictation: ObservableObject {
         audioEngine.stop()
         audioEngine.inputNode.removeTap(onBus: 0)
         inputBuilder?.finish()
-        try? await analyzer?.finalizeAndFinish(through: .latest)
-        analyzer = nil
-        transcriber = nil
+        try? await analyzer?.finalizeAndFinishThroughEndOfInput()
+        analyzer = nil; transcriber = nil
         isListening = false
     }
 
@@ -1074,84 +797,48 @@ final class SpeechAnalyzerDictation: ObservableObject {
         let nativeFormat = inputNode.outputFormat(forBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: nativeFormat) { [weak self] buffer, _ in
             guard let self, let format = self.format, let builder = self.inputBuilder else { return }
-            do {
-                let converted = try self.converter.convertBuffer(buffer, to: format)
+            // Convert to analyzer format (see Apple's "Recognizing speech in live audio" sample,
+            // updated for iPadOS 27's AnalyzerInputConverter if you gate on 27).
+            if let converted = try? BufferConverter.shared.convert(buffer, to: format) {
                 builder.yield(AnalyzerInput(buffer: converted))
-            } catch {
-                // Drop buffer on conversion error
             }
         }
         audioEngine.prepare()
         try audioEngine.start()
     }
 
-    private func requestAuthorization() async -> Bool {
-        await withCheckedContinuation { continuation in
-            SFSpeechRecognizer.requestAuthorization { status in
-                continuation.resume(returning: status == .authorized)
-            }
+    private func ensureModel(for transcriber: SpeechTranscriber) async throws {
+        let locale = Locale.current
+        let supported = await SpeechTranscriber.supportedLocales
+        guard supported.contains(locale) else { throw NSError(domain: "Speech", code: 1) }
+        if await SpeechTranscriber.installedLocales.contains(locale) { return }
+        if let request = try await AssetInventory.assetInstallationRequest(supporting: [transcriber]) {
+            try await request.downloadAndInstall()
         }
     }
-
-    private func ensureModel(for transcriber: SpeechTranscriber, locale: Locale) async throws {
-        let supported = await SpeechTranscriber.supportedLocales.contains(locale)
-        guard supported else { throw NSError(domain: "Speech", code: 1) }
-        if await SpeechTranscriber.installedLocales.contains(locale) { return }
-        let request = AssetInventory.assetInstallationRequest(supporting: [transcriber])
-        try await request?.downloadAndInstall()
-    }
 }
 ```
 
-### 7.2 iPadOS 18–25 fallback — `SFSpeechRecognizer`
+> API details drift between iOS 26.0 → 27.0 betas. Before shipping, diff against the current SDK interface (`xcrun swift-symbolgraph-extract` or the Axiom `axiom-apple-docs` skill) — WWDC25 sample code predates preset renames.
 
-Standard `SFSpeechAudioBufferRecognitionRequest` + `AVAudioEngine` flow. Wrap behind the same `Dictation` protocol so the view doesn't care:
+### 7.2 Fallback — `SFSpeechRecognizer` (iPadOS 18–25)
 
-```swift
-protocol Dictation: AnyObject {
-    var transcript: String { get }
-    var isListening: Bool { get }
-    func start() async throws
-    func stop() async
-}
-```
-
-Pick one in a factory based on `if #available(iOS 26, *)`.
+Keep the `Dictation` protocol + `SFSpeechDictation` from v1 behind `#if !os(iOS 26)` / `if #available(iOS 26, *)`. Requires `NSSpeechRecognitionUsageDescription` + runtime authorization; set `requiresOnDeviceRecognition = true`; ~1-minute cap.
 
 ### 7.3 Voice → chat hand-off
 
-The `VoiceInputBar` watches `dictation.transcript` and writes it to `ChatViewModel.input`. On `stop()`, if the transcript is non-empty, it calls `viewModel.send()`. Wire-up is intentionally trivial — the abstraction does the work.
+Unchanged: `VoiceInputBar` observes the dictation object, writes to `ChatViewModel.input`, calls `send()` on stop when transcript non-empty.
 
 ---
 
 ## 8. Local OpenAI-compatible HTTP server (L3)
 
-Embedded inside the iPad app. Bound to `127.0.0.1` only by default; toggleable to `0.0.0.0` for LAN testing (gated by a setting and a banner warning).
+### 8.1 Hummingbird 2.29.0 (2026-11-19)
 
-### 8.1 `MLXChatServer/Package.swift`
+No 3.x exists. The v1 code shape is still correct: `Router`, `Application(router:configuration:)`, `runService()`. Two updates:
 
-```swift
-// swift-tools-version: 6.0
-import PackageDescription
-let package = Package(
-    name: "MLXChatServer",
-    platforms: [.iOS(.v18), .macOS(.v14)],
-    products: [.library(name: "MLXChatServer", targets: ["MLXChatServer"])],
-    dependencies: [
-        .package(path: "../MLXChatCore"),
-        .package(url: "https://github.com/hummingbird-project/hummingbird", from: "2.0.0"),
-    ],
-    targets: [
-        .target(name: "MLXChatServer", dependencies: [
-            .product(name: "MLXChatCore", package: "MLXChatCore"),
-            .product(name: "Hummingbird", package: "hummingbird"),
-        ])
-    ],
-    swiftLanguageModes: [.v6]
-)
-```
-
-### 8.2 The server
+- Streaming SSE: return `Response(status: .ok, headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"], body: ResponseBody(asyncSequence: bytes))` where `bytes` is `AsyncSequence<ByteBuffer, Error>`. Or use **SSEKit** (`hummingbird-project/sse-kit`).
+- `ResponseBody` also supports the closure form (`ResponseBody { writer in … }`).
 
 ```swift
 // Sources/MLXChatServer/Server.swift
@@ -1160,348 +847,224 @@ import Hummingbird
 import MLXChatCore
 
 public actor ChatServer {
-    private var app: Application<RouterResponder<BasicRequestContext>>?
     private let engineProvider: @Sendable () async -> any LLMEngine
+    private var task: Task<Void, Error>?
 
     public init(engineProvider: @Sendable @escaping () async -> any LLMEngine) {
         self.engineProvider = engineProvider
     }
 
-    public func start(host: String = "127.0.0.1", port: Int = 8765) async throws {
-        let router = Router()
-        router.get("/healthz") { _, _ in "ok" }
-        router.get("/v1/models") { _, _ in
-            ModelsResponse(data: ModelCatalog.all.map(ModelObject.init))
-        }
-        router.post("/v1/chat/completions") { [engineProvider] req, ctx in
-            let body = try await req.decode(as: ChatCompletionRequest.self, context: ctx)
-            let engine = await engineProvider()
-            let messages = body.messages.map { ChatMessage(role: .init(rawValue: $0.role) ?? .user, content: $0.content) }
-            let opts = GenerateOptions()
-
-            if body.stream == true {
-                return Response(status: .ok, headers: ["content-type": "text/event-stream"]) { writer in
-                    let stream = engine.stream(messages: messages, options: opts)
-                    for try await token in stream {
-                        let chunk = ChatCompletionChunk(content: token.text, isFinal: token.isFinal)
-                        let data = try JSONEncoder().encode(chunk)
-                        try await writer.write(.init("data: \(String(data: data, encoding: .utf8)!)\n\n"))
-                    }
-                    try await writer.write(.init("data: [DONE]\n\n"))
-                }
-            } else {
-                let (text, _) = try await engine.respond(messages: messages, options: opts)
-                return ChatCompletionResponse(content: text)
+    public func start(host: String = "127.0.0.1", port: Int = 8765) {
+        task = Task {
+            let router = Router()
+            router.get("/healthz") { _, _ in "ok" }
+            router.get("/v1/models") { _, _ in
+                ModelsResponse(data: ModelCatalog.all.map(ModelObject.init))
             }
+            router.post("/v1/chat/completions") { [engineProvider] req, ctx in
+                let body = try await req.decode(as: ChatCompletionRequest.self, context: ctx)
+                let engine = await engineProvider()
+                let messages = body.messages.map {
+                    ChatMessage(role: .init(rawValue: $0.role) ?? .user, content: $0.content)
+                }
+                let opts = GenerateOptions()
+
+                if body.stream == true {
+                    let stream = engine.stream(messages: messages, options: opts)
+                    let bytes = AsyncStream<ByteBuffer> { continuation in
+                        Task {
+                            for try await token in stream {
+                                let chunk = ChatCompletionChunk(content: token.text, isFinal: token.isFinal)
+                                if let data = try? JSONEncoder().encode(chunk),
+                                   let line = String(data: data, encoding: .utf8) {
+                                    var buf = ByteBufferAllocator().buffer(string: "data: \(line)\n\n")
+                                    continuation.yield(buf)
+                                    buf.moveReaderIndex(to: buf.writerIndex)
+                                }
+                            }
+                            continuation.yield(ByteBufferAllocator().buffer(string: "data: [DONE]\n\n"))
+                            continuation.finish()
+                        }
+                    }
+                    return Response(
+                        status: .ok,
+                        headers: [.contentType: "text/event-stream", .cacheControl: "no-cache"],
+                        body: ResponseBody(asyncSequence: bytes)
+                    )
+                } else {
+                    let (text, _) = try await engine.respond(messages: messages, options: opts)
+                    return Response(status: .ok, body: .init(byteBuffer: ByteBuffer(data: try JSONEncoder().encode(ChatCompletionResponse(content: text)))))
+                }
+            }
+
+            let app = Application(
+                router: router,
+                configuration: .init(address: .hostname(host, port: port))
+            )
+            try await app.runService()
         }
-
-        var app = Application(
-            router: router,
-            configuration: .init(address: .hostname(host, port: port))
-        )
-        try await app.runService()
-        self.app = app
     }
 
-    public func stop() async {
-        // Hummingbird 2 clean shutdown
+    public func stop() {
+        task?.cancel()
+        task = nil
     }
 }
-
-// MARK: - DTOs (Data Transfer Objects)
-
-struct ChatCompletionRequest: Codable {
-    struct Msg: Codable { let role: String; let content: String }
-    let model: String
-    let messages: [Msg]
-    let stream: Bool?
-}
-struct ChatCompletionResponse: Codable, ResponseEncodable {
-    let content: String
-}
-struct ChatCompletionChunk: Codable { let content: String; let isFinal: Bool }
-struct ModelObject: Codable {
-    let id: String
-    let owned_by: String
-    init(_ d: ModelDescriptor) { self.id = d.huggingFaceRepo; self.owned_by = "mlxchat" }
-}
-struct ModelsResponse: Codable, ResponseEncodable { let data: [ModelObject] }
 ```
 
-### 8.3 When to start it
+DTOs (`ChatCompletionRequest/Response/Chunk`, `ModelObject`, `ModelsResponse`) unchanged from v1.
 
-- Default: server is **off** at app launch.
-- Settings toggle: `Local Server → On`. Starts on `127.0.0.1:8765`.
-- LAN toggle (separate, gated, with red banner): switches to `0.0.0.0:8765`.
-- iPadOS will not allow truly background HTTP serving for sustained periods — the server stops when the app is backgrounded for more than ~30 seconds. Document this in the settings sheet.
+### 8.2 Lifecycle rules
 
-### 8.4 Test the server from your Mac
-
-```bash
-# On the iPad, find its local IP under Settings → Wi-Fi → (i) → IP Address
-curl http://192.168.1.42:8765/v1/chat/completions \
-  -H "content-type: application/json" \
-  -d '{"model":"qwen3","messages":[{"role":"user","content":"hello"}]}'
-```
+- Default **off** at launch; Settings toggle starts it on `127.0.0.1:8765`.
+- iPadOS suspends the app in background → server stops. Document in Settings.
+- **Loopback needs no permissions** (TN3179). A LAN-bind toggle would need `NSLocalNetworkUsageDescription` — out of scope for v1; if added, gate behind a red-banner setting.
 
 ---
 
 ## 9. RAG hook stub (`MLXChatRAG`)
 
-A clean abstraction so you can wire in your existing Basic Memory MCP or a simple BM25 index later without touching the rest of the app.
-
-```swift
-// Sources/MLXChatRAG/Retriever.swift
-import Foundation
-import MLXChatCore
-
-public protocol Retriever: Actor {
-    func retrieve(query: String, k: Int) async throws -> [RetrievedChunk]
-}
-
-public struct RetrievedChunk: Sendable, Codable, Identifiable {
-    public let id: String
-    public let content: String
-    public let score: Float
-    public let source: String?
-}
-
-public actor StubRetriever: Retriever {
-    public init() {}
-    public func retrieve(query: String, k: Int) async throws -> [RetrievedChunk] {
-        return [] // wire up your vector store / Basic Memory MCP here
-    }
-}
-
-/// Augments a user message with retrieved context before generation.
-public extension Array where Element == ChatMessage {
-    func withRetrievedContext(_ chunks: [RetrievedChunk]) -> [ChatMessage] {
-        guard !chunks.isEmpty else { return self }
-        let ctx = chunks.map { "- \($0.content)" }.joined(separator: "\n")
-        let augmented = "Use this context if relevant:\n\(ctx)\n\n" +
-            (last(where: { $0.role == .user })?.content ?? "")
-        var copy = self
-        if let idx = copy.lastIndex(where: { $0.role == .user }) {
-            copy[idx].content = augmented
-        }
-        return copy
-    }
-}
-```
-
-In `ChatViewModel.send()`, before calling `engine.stream(...)`, insert:
-
-```swift
-let retriever: any Retriever = StubRetriever()
-let chunks = try await retriever.retrieve(query: trimmed, k: 5)
-let augmented = messages.dropLast().withRetrievedContext(chunks)
-let stream = engine.stream(messages: augmented, options: GenerateOptions())
-```
+Unchanged from v1 — `Retriever` protocol, `StubRetriever`, `withRetrievedContext`. Swap in Basic Memory MCP or a BM25 index later.
 
 ---
 
-## 10. Memory pressure handling (the part everyone forgets)
+## 10. Memory pressure handling
 
-```swift
-// MLXChat/MemoryGovernor.swift
-import Foundation
-import os
-
-@MainActor
-final class MemoryGovernor: ObservableObject {
-    @Published var warningCount = 0
-    @Published var available: UInt64 = 0
-    private var observer: NSObjectProtocol?
-    private var timer: Timer?
-
-    func start() {
-        observer = NotificationCenter.default.addObserver(
-            forName: UIApplication.didReceiveMemoryWarningNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handleWarning()
-            }
-        }
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.available = UInt64(os_proc_available_memory())
-            }
-        }
-    }
-
-    private func handleWarning() {
-        warningCount += 1
-        // 1. Clear MLX's GPU cache first — usually enough to recover.
-        MLX.GPU.clearCache()
-        // 2. If warnings keep arriving, prompt the user to switch to a smaller model.
-        if warningCount >= 3 {
-            // Post a notification the ChatViewModel listens to.
-            NotificationCenter.default.post(name: .mlxChatNeedsSmallerModel, object: nil)
-        }
-    }
-}
-extension Notification.Name {
-    static let mlxChatNeedsSmallerModel = Notification.Name("mlxChatNeedsSmallerModel")
-}
-```
-
-Display `available` in the StatsBar — it's the single most useful debug signal you'll have.
+Unchanged from v1 (`MemoryGovernor` + `os_proc_available_memory()` + `MLX.GPU.clearCache()` on warning; notify at 3 warnings). Add: log `os_proc_available_memory()` at model load, after load, and every 2 s while generating — this is the number that predicts jetsam. Remember the iPadOS 26.4–26.5 regression was on 8 GB devices; on 16 GB, still verify.
 
 ---
 
 ## 11. Step-by-step build order
 
-This is the order I'd actually do this in — each step verifiable in isolation before the next:
-
 | # | Task | Verify |
 |---|---|---|
-| 1 | Create Xcode workspace + iOS app target + the four SPM packages | App builds empty |
-| 2 | Add SPM dependencies to `MLXChatCore` Package.swift | Resolve succeeds |
-| 3 | Add entitlements + Info.plist keys | Build succeeds with `Increased Memory Limit` shown in Signing & Capabilities |
-| 4 | Implement `LLMEngine` protocol and types (§3.1, §3.2) | Compiles |
-| 5 | Implement `MLXEngine` (§3.4) | Build, do not run |
-| 6 | Wire up minimal `ChatViewModel` and a smoke-test view that just calls `engine.respond("hello")` | **Run on real iPad.** First run downloads ~5GB; expect 1–2 min on good Wi-Fi. Verify text comes back. **This is your "hello world".** |
-| 7 | Add streaming UI (§6) | Tokens appear progressively |
-| 8 | Add `LlamaEngine` + GGUF model in catalog | Switch backends in picker, verify GGUF download + run |
-| 9 | Add `MemoryGovernor` + StatsBar | Watch `os_proc_available_memory()` count down during long generations |
-| 10 | Add `SpeechAnalyzer` voice input (with `SFSpeechRecognizer` fallback) | Tap mic, dictate, send |
-| 11 | Add `ModelPickerView` + hot-swap | Switch from Qwen3-8B to Qwen3-4B and back; verify memory drops/recovers |
-| 12 | Add Hummingbird HTTP server | `curl localhost:8765/healthz` from iPad's terminal app, then `curl http://<ipad-ip>:8765/v1/chat/completions` from your Mac |
-| 13 | Wire `StubRetriever` into the send path | Empty for now; integration with Basic Memory MCP is a separate work item |
-| 14 | TestFlight build, profile with Instruments (Memory + Time Profiler) | Sustain a 2k-token generation without jetsam |
-| 15 | App Store submission prep | App privacy answers (microphone, no tracking), screenshots |
+| 1 | XcodeGen `project.yml` + workspace + iOS app target + local SPM package | App builds empty |
+| 2 | SPM deps resolve (mlx-swift 0.33.0, mlx-swift-lm 3.33.0, …) | `xcodebuild -resolvePackageDependencies` |
+| 3 | Entitlements + Info.plist (§5) | Build shows Increased Memory Limit |
+| 4 | `LLMEngine` protocol + types (§3.1–3.2) | Compiles |
+| 5 | `MLXEngine` (§3.4) | Build only |
+| 6 | Minimal `ChatViewModel` + smoke view → `engine.respond("hello")` | **Run on presto (real iPad).** First run downloads ~6 GB; 1–3 min on good Wi-Fi. This is your hello-world. |
+| 7 | Streaming UI (§6) | Tokens appear progressively |
+| 8 | `LlamaEngine` + GGUF catalog entry | Switch backends, verify GGUF path |
+| 9 | `MemoryGovernor` + StatsBar | Watch available memory during long generations |
+| 10 | `SpeechAnalyzer` dictation + `SFSpeechRecognizer` fallback | Tap mic, dictate, send |
+| 11 | `ModelPickerView` + hot-swap | Swap Qwen3.5-9B ↔ 4B; memory drops/recovers |
+| 12 | Hummingbird server | `curl localhost:8765/healthz` on-device; `curl` from Mac to iPad IP (LAN toggle) |
+| 13 | `StubRetriever` wired into send path | No-op today |
+| 14 | TestFlight build; Instruments (Memory + Time Profiler) | Sustain 2k-token generation without jetsam |
+| 15 | App Store prep | Privacy labels ("Data Not Collected"), `ITSAppUsesNonExemptEncryption=NO`, review notes re: on-device model download |
 
 ---
 
-## 12. Performance expectations (what to verify with Instruments)
-
-Based on community benchmarks for Qwen3-8B at 4-bit on M-series silicon. The iPad M4 GPU is a 10-core (binned vs M4 Pro), with **120 GB/s** memory bandwidth — substantially less than M4 Max (~546 GB/s) but better than the M4 base in MacBook Air.
+## 12. Performance expectations (M4 iPad, 120 GB/s)
 
 | Metric | Expected | Why |
 |---|---|---|
-| Cold model load | 8–15 s | Includes safetensors → Metal upload |
-| Warm model load (already in cache) | 2–4 s | Memory map only |
-| Prompt processing (1k tokens) | ~80–120 t/s | Bandwidth-bound |
-| Generation speed | **22–32 t/s** for Qwen3-8B 4-bit | Memory-bandwidth-bound, M4 base GPU |
-| Generation speed (Qwen3-4B 4-bit) | **40–55 t/s** | Smaller model, less bandwidth needed |
-| Time to first token | 0.4–0.8 s for 100-token prompt | Prompt processing dominates |
-| Resident memory peak | ~9–10 GB during 32k context | Fits within ~12 GB ceiling |
+| Cold model load | 8–15 s | safetensors → Metal upload |
+| Warm load | 2–4 s | mmap |
+| Prompt processing (1k tok) | ~80–120 t/s | bandwidth-bound |
+| **Qwen3.5-9B-4bit decode** | **~18–25 t/s** | bandwidth-bound (M4 base GPU) |
+| Qwen3.5-4B-4bit decode | ~35–40 t/s | |
+| Gemma-4-E2B decode | ~30–35 t/s | |
+| TTFT (100-token prompt) | 0.4–0.8 s | prompt processing dominates |
+| Resident peak (32k ctx) | ~9–11 GB | fits 12 GB ceiling |
 
-If you observe < 15 t/s on Qwen3-8B-4bit, something is wrong. Likely culprits, in order:
-1. Built in Debug configuration (try Release).
-2. Buffer cache cap set too low (try 512 MB instead of 256 MB).
-3. Background task is pegging the GPU (close other apps).
-4. Thermal throttling — iPad has gotten hot. Let it cool, retest.
+< 15 t/s on Qwen3.5-9B → check: (1) Release config, (2) cache limit 512 MB, (3) background GPU load, (4) thermal throttling.
+
+TurboQuant `turbo8v3` costs ~0.7–0.8× decode — only enable past ~16k context.
 
 ---
 
-## 13. Distribution plan (your 2/3/4 answer)
+## 13. Distribution plan
 
 ### 13.1 Personal (paid Apple Developer account)
+Self-serve Increased Memory Limit; install via Xcode/devicectl on presto.
 
-Standard signing. The `Increased Memory Limit` entitlement is granted automatically — no special request required.
-
-### 13.2 TestFlight (friends/family)
-
-Same entitlements. Two extra steps:
-- App Store Connect → distribute build → fill out **Encryption Compliance** (`ITSAppUsesNonExemptEncryption = NO` in Info.plist if you only use HTTPS via standard libs and the local server isn't using custom crypto).
-- Privacy nutrition label: declare microphone, declare no tracking, declare no data collection (since everything is on-device).
+### 13.2 TestFlight
+- `ITSAppUsesNonExemptEncryption = NO`.
+- Privacy nutrition label: **Data Not Collected** (all on-device; no analytics).
+- Verify the **distribution** provisioning profile carries the memory entitlement: `codesign -d --entitlements :-`.
+- Beta review still enforces 2.5.2 / privacy labels.
 
 ### 13.3 App Store
-
-Watch out for:
-- **App size.** The model is *not* bundled (good). Apple's review team will install on a test device with no Wi-Fi history; the first-run download must work over LTE or a guest Wi-Fi without auth wall. Test this.
-- **App size 2.** Even without the model, MLX ships a lot of Metal kernels. Expect ~80–150 MB IPA.
-- **Review notes.** Tell Apple: "On first launch, the app downloads a ~4.7 GB language model from Hugging Face and runs all inference locally. No data leaves the device. The model is required for the app's primary function."
-- **Privacy.** Declare microphone usage even if voice is optional. Reviewers test it.
-- **Background audio mode.** If you keep dictation alive across backgrounding, document why. Otherwise, drop the `audio` background mode and stop dictation in `scenePhase == .background`.
+- **2.5.2**: model weights are data, not code — accepted reading per Apple DTS (2025–2026). Precedents live today: **Locally AI** (LM Studio's iPad app), **Private LLM**, **Enchanted**, **PocketPal AI**. Disclose model download in review notes + privacy label.
+- **2.3.1(a)**: describe AI features specifically in review notes; no login wall.
+- **2.5.19**: no hidden/dormant features — disclose downloads.
+- **4.2.3(ii)**: disclose download size before first-launch download; prompt the user.
+- **5.1.2(i)**: if any prompt ever leaves the device, explicit consent + label it. (v1: never leaves.)
+- **4.2 minimum functionality**: fine — real on-device inference.
+- **Model delivery**: **do not use On-Demand Resources** — deprecated in iPadOS 27, rejected from early 2027. Use plain background `URLSession` download (PocketPal/Private LLM pattern) or **Background Assets** (Apple-hosted, up to 200 GB, managed) if you want Apple hosting. 4 GB app bundle cap; don't bundle weights.
+- Expect ~80–150 MB IPA.
 
 ---
 
-## 14. Risks & open questions
+## 14. Risks & open questions (updated 2026-11-25)
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| `mlx-swift-lm` 3.x API drifts from this manual before you start | Medium | Pin to `3.31.3` exactly via `.exact("3.31.3")` in Package.swift; bump when you have time |
-| Apple rejects the app for "downloads executable code" | Low — model weights aren't code | Cite Hugging Face precedent (LM Studio, MLX Chat are on the App Store) |
-| iPadOS 26 SpeechAnalyzer model assets fail to install | Low | Detect, fall back to `SFSpeechRecognizer` cleanly |
-| TurboQuant KV cache compression lands in `mlx-swift` upstream | Medium | If/when it does, opt in via a build flag; gives 15–19% decode speedup at long context. Not in scope for v1 |
-| You bought the 256/512 GB iPad and only have 8 GB | Confirmed not the case (1TB+ tier) | n/a |
+| mlx-swift-lm API drift | Medium | Pin `from: 3.33.0`; watch releases; `upgrade.md` in repo |
+| iPadOS 26.4–26.5 8 GB jetsam regression | Low for 16 GB | Verify with `os_proc_available_memory()`; fixed in 26.6 beta 5 per DTS |
+| SpeechAnalyzer API drift iOS 26→27 | Medium | Diff against SDK each Xcode bump; keep SFSpeechRecognizer fallback |
+| App Review rejects on-device download | Low | Precedents §13.3; disclose in notes; no executable code |
+| `LocalLLMClient` API instability | High (by design) | Pin `exact: 0.5.0`; isolate behind `LLMEngine` |
+| AFM 3 / Core AI makes MLX obsolete | Low–Med | Track; MLX still wins on model choice/long context; `MLXFoundationModels` bridge exists if you want both |
 
-### Open questions you should think about before coding
+### Open questions
 
-1. **System prompt persistence.** Should each model carry its own default system prompt, or should it be user-edited and stored once per app? I default to per-app + per-model override, but you may want per-conversation.
-2. **Conversation persistence.** Not in v1 scope as written. Want SwiftData or just `@AppStorage`-backed JSON? SwiftData is overkill for v1; `@AppStorage` JSON is fine until you hit 100+ conversations.
-3. **Thinking blocks.** Qwen3 emits `<think>...</think>` chains. Render collapsed by default? I'd say yes. Trivial regex split in the message bubble.
-4. **Tool calling.** `LocalLLMClient` flagged tool-calling as experimental. Worth keeping out of v1.
-5. **Model deletion.** Where in the model picker should "delete cached weights" live? Long-press? Settings? I'd put it in a swipe action on each `ModelRow`.
+1. **System prompt persistence** — per-model default + user override (current default) vs per-conversation.
+2. **Conversation persistence** — `@AppStorage` JSON until >100 conversations, then SwiftData.
+3. **Thinking blocks** — Qwen3.5 emits `<think>…</think>`; render collapsed by default.
+4. **Tool calling** — `MLXGuidedGeneration` (grammar-constrained, ships in 3.32.3+) is the supported path now; LocalLLMClient tool-calling still experimental. Post-v1.
+5. **Foundation Models tier** — offer AFM 3 Core (free, zero-download, iPadOS 27) as a "fast/free" engine behind the same `LLMEngine` protocol? `MLXFoundationModels` makes this ~1 day of work. Decide before TestFlight.
+6. **Core AI** (new iPadOS 27 framework for on-device custom models) — evaluate alongside MLX for v2; not a drop-in today.
 
 ---
 
 ## 15. CLAUDE_NOTES.md entries to log after this build
 
-Per your iteration protocol — when you're done, log these:
-
-- ✅ SUCCESS: `mlx-swift-lm` 3.x is the new home for LLM/VLM code (replaces `mlx-swift-examples` libraries). `LocalLLMClient` already migrated as of v0.4.6.
-- ✅ SUCCESS: `MLX.GPU.set(cacheLimit: 256MB)` is the empirical sweet spot for 8B models on 16GB iPads.
-- ⚠️ NEEDS IMPROVEMENT: `EngineStats.peakResidentMemoryBytes` is sampled, not a true peak. Wire up a sampling timer during generation if you need accurate peaks.
-- ❌ AVOID: Loading the model in `App.init`. Always load in the root view's `.task`.
-- ❌ AVOID: Running MLX in the iOS Simulator. Build UI there, run inference on hardware only.
-
----
-
-## Appendix A — Quick reference: where each file goes
-
-```
-MLXChat.xcworkspace/
-├── MLXChat/                                   # iOS app
-│   ├── App/
-│   │   ├── MLXChatApp.swift
-│   │   └── MLXChat.entitlements
-│   ├── Chat/
-│   │   ├── ChatView.swift
-│   │   ├── ChatViewModel.swift
-│   │   ├── MessageListView.swift
-│   │   ├── MessageBubble.swift
-│   │   ├── ComposerView.swift
-│   │   └── StatsBar.swift
-│   ├── Models/
-│   │   ├── ModelPickerView.swift
-│   │   └── ModelRow.swift
-│   ├── Voice/
-│   │   ├── Dictation.swift                    # Protocol
-│   │   ├── SpeechAnalyzerDictation.swift      # iPadOS 26+
-│   │   ├── SFSpeechDictation.swift            # iPadOS 18 fallback
-│   │   ├── BufferConverter.swift              # Apple sample helper
-│   │   └── VoiceInputBar.swift
-│   ├── Server/
-│   │   └── ServerControlView.swift
-│   └── System/
-│       └── MemoryGovernor.swift
-└── Packages/
-    ├── MLXChatCore/
-    ├── MLXChatEngineMLX/  (target inside MLXChatCore SPM)
-    ├── MLXChatEngineLlama/(target inside MLXChatCore SPM)
-    ├── MLXChatServer/
-    └── MLXChatRAG/
-```
+- ✅ mlx-swift-lm 3.33.0 is current; 3.x decouples tokenizer/downloader; `#huggingFaceLoadModelContainer` is the load path.
+- ✅ TurboQuant KV shipped (2026-07-20); `turbo8v3` past ~16k context only.
+- ✅ Qwen3.5-9B-MLX-4bit is the default; Qwen3-8B-4bit-AWQ deprecated.
+- ⚠️ `os_proc_available_memory()` is the only truth; iPadOS 26.4–26.5 regressed 8 GB devices.
+- ⚠️ `MLXEngine` streaming: `decode(tokenIds:)` not `decode(tokens:)`.
+- ❌ Don't load the model in `App.init`. Don't run MLX in the simulator. Don't use On-Demand Resources for model delivery.
 
 ---
 
-## Appendix B — Source verification (so you can audit my claims)
+## Appendix A — File layout
+
+```
+MLXChat/
+├── project.yml                      # XcodeGen spec
+├── MLXChat.xcodeproj                # generated
+├── MLXChat/                         # app target
+│   ├── App/MLXChatApp.swift
+│   ├── App/MLXChat.entitlements
+│   ├── Chat/{ChatView,ChatViewModel,MessageListView,MessageBubble,ComposerView,StatsBar}.swift
+│   ├── Models/{ModelPickerView,ModelRow}.swift
+│   ├── Voice/{Dictation,SpeechAnalyzerDictation,SFSpeechDictation,BufferConverter,VoiceInputBar}.swift
+│   ├── Server/ServerControlView.swift
+│   └── System/MemoryGovernor.swift
+└── Packages/MLXChatPackages/
+    ├── Package.swift
+    └── Sources/{MLXChatCore,MLXChatEngineMLX,MLXChatEngineLlama,MLXChatServer,MLXChatRAG}/
+```
+
+## Appendix B — Source verification (2026-11-25)
 
 | Claim | Source | Date |
 |---|---|---|
-| iPad Pro 11" M4 1TB+ has 16 GB RAM, 120 GB/s bandwidth | apple.com/ipad/compare; support.apple.com/en-us/119892 | Active |
-| Increased Memory Limit ceiling ~12 GB on 16 GB iPad | developer.apple.com/forums/thread/724195; thread/777370 | March 2025 |
-| `mlx-swift-lm` 3.31.3 is current, replaces examples libraries | swiftpackageindex.com/ml-explore/mlx-swift-lm | April 17, 2026 |
-| `LocalLLMClient` 0.4.6 with mlx-swift-lm migration | github.com/tattn/LocalLLMClient releases; PR #85 | November 27, 2025 + April 2026 |
-| MLX is 15–30% faster than llama.cpp on Apple Silicon | willitrunai.com/blog/mlx-vs-ollama-apple-silicon-benchmarks | 1 week ago |
-| Qwen3-8B-4bit-AWQ exists at `mlx-community/Qwen3-8B-4bit-AWQ` | huggingface.co/mlx-community/Qwen3-8B-4bit-AWQ | Active |
-| `SpeechAnalyzer` API design (modular, async, on-device) | developer.apple.com WWDC25-277; Speech framework docs | June 2025 |
-| `LLMModelFactory.shared.loadContainer` is the load API | github.com/ml-explore/mlx-swift-examples releases | Migration notes |
-| Increased Memory Limit + Extended Virtual Addressing entitlements | developer.apple.com/documentation/bundleresources/entitlements/com.apple.developer.kernel.increased-memory-limit | Active |
+| mlx-swift 0.33.0 / mlx-swift-lm 3.33.0 / swift-transformers 1.4.0 / swift-huggingface 1.0.1 / hummingbird 2.29.0 / LocalLLMClient 0.5.0 | GitHub releases | 2026-10-27 → 2026-11-19 |
+| `loadContainer(from:using:)` / `#huggingFaceLoadModelContainer` | mlx-swift-lm README + using.md | 2026-11-25 |
+| Qwen3.5-9B-MLX-4bit (5.95 GB, 23k dl) | huggingface.co/mlx-community | 2026-11-25 |
+| TurboQuant merged (PR #232) | github.com/ml-explore/mlx-swift-lm | 2026-07-20 |
+| SpeechAnalyzer shipping since iOS/iPadOS 26; 27 adds input-sequence providers | developer.apple.com WWDC25-277; Speech docs | 2026-11-25 |
+| iPadOS 26.4–26.5 8 GB jetsam regression; fixed 26.6 beta 5 | Apple Forums thread 826325; FB22883960 | 2026 |
+| ODR deprecated in iPadOS 27; Background Assets is the path | developer.apple.com; WWDC25-325 | 2026 |
+| Loopback needs no Local Network permission | Apple TN3179 | 2026-11-25 |
+| App Review 2.5.2 weights-as-data; precedents (Locally AI, Private LLM, Enchanted, PocketPal) | App Review Guidelines (2026-10-16); App Store listings | 2026-11-25 |
+| AFM 3 (Core / Core Advanced) on iPadOS 27; MLX is a first-class LanguageModel provider | machinelearning.apple.com; WWDC26 | 2026-06/09 |
+| Qwen3.5-9B ≈ 18–25 tok/s on M4 iPad (bandwidth-derived + third-party measurements) | lapis.lvrpiz.com; Apple M5-vs-M4 MLX study | 2026 |
+| Increased Memory Limit self-serve; verify distribution profile | Apple DTS via developer forums | 2026 |
 
-— end of manual —
+— end of manual (v2, 2026-11-25) —
